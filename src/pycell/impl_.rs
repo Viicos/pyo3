@@ -228,8 +228,8 @@ where
     fn check_threadsafe(&self) -> Result<(), PyBorrowError> {
         Ok(())
     }
-    unsafe fn tp_dealloc(py: Python<'_>, slf: *mut ffi::PyObject) {
-        unsafe { tp_dealloc(slf, &T::type_object(py)) };
+    unsafe fn tp_dealloc(py: Python<'_>, slf: *mut ffi::PyObject, base_tp: *mut ffi::PyTypeObject) {
+        unsafe { tp_dealloc(py, slf, base_tp) };
     }
 }
 
@@ -248,20 +248,24 @@ impl<T: PyTypeInfo> PyClassObjectBaseLayout<T> for PyVariableClassObjectBase {
     fn check_threadsafe(&self) -> Result<(), PyBorrowError> {
         Ok(())
     }
-    unsafe fn tp_dealloc(py: Python<'_>, slf: *mut ffi::PyObject) {
-        unsafe { tp_dealloc(slf, &T::type_object(py)) };
+    unsafe fn tp_dealloc(py: Python<'_>, slf: *mut ffi::PyObject, base_tp: *mut ffi::PyTypeObject) {
+        unsafe { tp_dealloc(py, slf, base_tp) };
     }
 }
 
 /// Implementation of tp_dealloc.
 /// # Safety
-/// - `slf` must be a valid pointer to an instance of the type at `type_obj` or a subclass.
+/// - `slf` must be a valid pointer to an instance of the type whose base is `base_tp`, or a subclass.
+/// - `base_tp` must be a valid, live pointer to the base type object whose `tp_dealloc`/`tp_free`
+///   should finish deallocating `slf`. It is read from the `tp_base` slot of a type object PyO3
+///   keeps alive for the lifetime of the interpreter, so it stays valid even during interpreter
+///   finalization (unlike re-importing a native base's type object, e.g. via the `datetime` C-API,
+///   whose cache may already be torn down).
 /// - `slf` must not be used after this call (as it will be freed).
-unsafe fn tp_dealloc(slf: *mut ffi::PyObject, type_obj: &crate::Bound<'_, PyType>) {
-    let py = type_obj.py();
+unsafe fn tp_dealloc(py: Python<'_>, slf: *mut ffi::PyObject, base_tp: *mut ffi::PyTypeObject) {
     unsafe {
-        // FIXME: there is potentially subtle issues here if the base is overwritten
-        // at runtime? To be investigated.
+        let type_obj = PyType::from_borrowed_type_ptr(py, base_tp);
+        let type_obj = &type_obj;
         let type_ptr = type_obj.as_type_ptr();
         let actual_type = PyType::from_borrowed_type_ptr(py, ffi::Py_TYPE(slf));
 
@@ -307,10 +311,17 @@ pub trait PyClassObjectBaseLayout<T>: PyLayout<T> {
     fn ensure_threadsafe(&self);
     fn check_threadsafe(&self) -> Result<(), PyBorrowError>;
     /// Implementation of tp_dealloc.
+    ///
+    /// `base_tp` is the base type object whose `tp_dealloc`/`tp_free` should finish deallocating
+    /// `slf` once this layout's own contents have been dropped. Layouts for a `#[pyclass]` ignore
+    /// the incoming value and recompute it from their own (always-alive) type object's `tp_base`
+    /// slot before delegating to their base layout; native base layouts use it directly.
     /// # Safety
     /// - slf must be a valid pointer to an instance of a T or a subclass.
+    /// - `base_tp` must be a live pointer to the base type object of the layout (see the free
+    ///   `tp_dealloc` function for why this avoids use-after-free during interpreter finalization).
     /// - slf must not be used after this call (as it will be freed).
-    unsafe fn tp_dealloc(py: Python<'_>, slf: *mut ffi::PyObject);
+    unsafe fn tp_dealloc(py: Python<'_>, slf: *mut ffi::PyObject, base_tp: *mut ffi::PyTypeObject);
 }
 
 /// Functionality required for creating and managing the memory associated with a pyclass annotated struct.
@@ -471,11 +482,22 @@ where
         }
         self.ob_base.check_threadsafe()
     }
-    unsafe fn tp_dealloc(py: Python<'_>, slf: *mut ffi::PyObject) {
+    unsafe fn tp_dealloc(py: Python<'_>, slf: *mut ffi::PyObject, _base_tp: *mut ffi::PyTypeObject) {
         // Safety: Python only calls tp_dealloc when no references to the object remain.
         let class_object = unsafe { &mut *(slf.cast::<T::Layout>()) };
         unsafe { class_object.contents_mut().dealloc(py, slf) };
-        unsafe { <T::BaseType as PyClassBaseType>::LayoutAsBase::tp_dealloc(py, slf) }
+        // Read the base type from our own type object's `tp_base` slot rather than re-fetching the
+        // base type's type object (which, for native bases such as `datetime.tzinfo`, may go through
+        // a C-API cache that is already freed during interpreter finalization). Our type object is
+        // kept alive by PyO3 for the lifetime of the interpreter, so `tp_base` stays valid. We read
+        // it without (re)initializing the type, which would be unsound during finalization.
+        let base_tp = unsafe {
+            (*T::lazy_type_object()
+                .try_borrow_type_ptr(py)
+                .expect("type object must be initialized to deallocate one of its instances"))
+            .tp_base
+        };
+        unsafe { <T::BaseType as PyClassBaseType>::LayoutAsBase::tp_dealloc(py, slf, base_tp) }
     }
 }
 
@@ -579,11 +601,19 @@ where
         }
         self.ob_base.check_threadsafe()
     }
-    unsafe fn tp_dealloc(py: Python<'_>, slf: *mut ffi::PyObject) {
+    unsafe fn tp_dealloc(py: Python<'_>, slf: *mut ffi::PyObject, _base_tp: *mut ffi::PyTypeObject) {
         // Safety: Python only calls tp_dealloc when no references to the object remain.
         let class_object = unsafe { &mut *(slf.cast::<T::Layout>()) };
         unsafe { class_object.contents_mut().dealloc(py, slf) };
-        unsafe { <T::BaseType as PyClassBaseType>::LayoutAsBase::tp_dealloc(py, slf) }
+        // See the sized layout above: read the base from our own (always-alive) type object's
+        // `tp_base` slot, to avoid using a possibly-finalized base type's type object.
+        let base_tp = unsafe {
+            (*T::lazy_type_object()
+                .try_borrow_type_ptr(py)
+                .expect("type object must be initialized to deallocate one of its instances"))
+            .tp_base
+        };
+        unsafe { <T::BaseType as PyClassBaseType>::LayoutAsBase::tp_dealloc(py, slf, base_tp) }
     }
 }
 

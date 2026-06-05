@@ -1102,9 +1102,17 @@ pub trait PyClassBaseType: Sized {
     type Layout<T: PyClassImpl>;
 }
 
+/// Entry point passed to the dealloc trampoline. The top layout recomputes the base type object
+/// from its own (always-alive) `tp_base` slot, so the initial `base_tp` is unused and passed as null.
+unsafe fn tp_dealloc_entry<T: PyClass>(py: Python<'_>, slf: *mut ffi::PyObject) {
+    unsafe {
+        <T as PyClassImpl>::Layout::tp_dealloc(py, slf, core::ptr::null_mut());
+    }
+}
+
 /// Implementation of tp_dealloc for pyclasses without gc
 pub(crate) unsafe extern "C" fn tp_dealloc<T: PyClass>(obj: *mut ffi::PyObject) {
-    unsafe { crate::impl_::trampoline::dealloc(obj, <T as PyClassImpl>::Layout::tp_dealloc) }
+    unsafe { crate::impl_::trampoline::dealloc(obj, tp_dealloc_entry::<T>) }
 }
 
 /// Implementation of tp_dealloc for pyclasses with gc
@@ -1113,7 +1121,7 @@ pub(crate) unsafe extern "C" fn tp_dealloc_with_gc<T: PyClass>(obj: *mut ffi::Py
     unsafe {
         ffi::PyObject_GC_UnTrack(obj.cast());
     }
-    unsafe { crate::impl_::trampoline::dealloc(obj, <T as PyClassImpl>::Layout::tp_dealloc) }
+    unsafe { crate::impl_::trampoline::dealloc(obj, tp_dealloc_entry::<T>) }
 }
 
 pub(crate) unsafe extern "C" fn get_sequence_item_from_mapping(

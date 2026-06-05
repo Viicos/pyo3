@@ -50,6 +50,21 @@ impl<T> LazyTypeObject<T> {
             PhantomData,
         )
     }
+
+    /// Returns the type object pointer if it has already been initialized, without attempting
+    /// initialization. Unlike [`get_or_try_init`](LazyTypeObject::get_or_try_init) this requires
+    /// only `T: PyClassImpl` and never runs initialization, so it is safe to call from contexts
+    /// such as `tp_dealloc` during interpreter finalization. Returns `None` if the type object has
+    /// not been created yet (in which case there can be no live instances to deallocate).
+    pub(crate) fn try_borrow_type_ptr(
+        &self,
+        py: Python<'_>,
+    ) -> Option<*mut ffi::PyTypeObject> {
+        self.0
+            .fully_initialized_type
+            .get(py)
+            .map(|ty| ty.as_ptr().cast())
+    }
 }
 
 impl<T: PyClass> LazyTypeObject<T> {
